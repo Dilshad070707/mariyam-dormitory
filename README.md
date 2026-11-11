@@ -5,7 +5,8 @@ Mobile-first public booking website with a separate staff dashboard, Express API
 ## What is included
 
 - Public website with business details, facilities, prices, location link, WhatsApp and Instagram links, availability search, booking request, booking lookup, and UPI reference submission.
-- Separate `/admin/login` dashboard for booking and payment review, check-in/check-out, customer list, and bed maintenance status.
+- Public availability now lists the actual available bed labels. Customers can request a stay of 1–30 fixed 24-hour days; rates multiply by selected days, and checkout remains at 10:00 AM.
+- Separate `/admin/login` dashboard for booking and payment review, check-in/check-out, customer list, bed maintenance, and editing each bed's display name and upper/lower type.
 - PostgreSQL migrations with seeded business information and 35 beds, unique UTR values, audit records, and a database exclusion constraint preventing overlapping confirmed allocations.
 - Server-side price calculation, 24-hour UTC instants from Asia/Kolkata check-in dates, password hashing, HTTP-only session cookies, login throttling, parameterized SQL, and expiring 15-minute pending bed holds.
 - Render Blueprint (`render.yaml`) and environment template.
@@ -30,7 +31,7 @@ To add another admin, run `npm run admin:create` again with a different email. T
 1. Create a private or public GitHub repository and push this folder. Never commit `.env`.
 2. In Render, choose **New → Blueprint**, connect the repository, and let Render create the web service and PostgreSQL database from `render.yaml`.
 3. Render supplies the web service's internal `DATABASE_URL` and generates a private `SESSION_SECRET`. This Blueprint uses free plans for an initial preview, so no payment card should be needed. The app checks same-origin requests automatically; `APP_ORIGIN` is optional if you want to pin a specific site origin.
-4. Initialize the database from your Windows laptop (this works when the Render web service is on its free plan, which does not provide a service Shell): copy the database's **external** connection URL from its Connect/Info page, add `?sslmode=require` if it is not already present, put it temporarily in `.env` as `DATABASE_URL=...`, then run `npm install`, `npm run db:migrate`, and `npm run admin:create`. The external URL is a secret; do not paste it into GitHub or chat.
+4. Initialize the database from your Windows laptop (this works when the Render web service is on its free plan, which does not provide a service Shell): copy the database's **external** connection URL from its Connect/Info page, add `?sslmode=require` if it is not already present, put it temporarily in `.env` as `DATABASE_URL=...`, then run `npm install`, `npm run db:migrate`, and `npm run admin:create`. The migration command applies all numbered SQL files. The external URL is a secret; do not paste it into GitHub or chat.
 5. After the schema and admin have been created, remove the temporary `.env` file from your laptop. Then open `/admin/login` on the deployed site and sign in.
 6. Check `/api/health`, make a small test booking request, and verify staff can sign in before sharing the site.
 
