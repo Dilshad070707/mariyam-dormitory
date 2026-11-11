@@ -2,6 +2,7 @@ services:
   - type: web
     name: mariyam-dormitory
     runtime: node
+    plan: free
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /api/health
@@ -16,5 +17,6 @@ services:
           property: connectionString
 databases:
   - name: mariyam-dormitory-db
+    plan: free
     databaseName: mariyam_dormitory
     user: mariyam_app

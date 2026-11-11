@@ -29,12 +29,12 @@ To add another admin, run `npm run admin:create` again with a different email. T
 
 1. Create a private or public GitHub repository and push this folder. Never commit `.env`.
 2. In Render, choose **New → Blueprint**, connect the repository, and let Render create the web service and PostgreSQL database from `render.yaml`.
-3. Render supplies the web service's internal `DATABASE_URL` and generates a private `SESSION_SECRET`. The app checks same-origin requests automatically; `APP_ORIGIN` is optional if you want to pin a specific site origin.
+3. Render supplies the web service's internal `DATABASE_URL` and generates a private `SESSION_SECRET`. This Blueprint uses free plans for an initial preview, so no payment card should be needed. The app checks same-origin requests automatically; `APP_ORIGIN` is optional if you want to pin a specific site origin.
 4. Initialize the database from your Windows laptop (this works when the Render web service is on its free plan, which does not provide a service Shell): copy the database's **external** connection URL from its Connect/Info page, add `?sslmode=require` if it is not already present, put it temporarily in `.env` as `DATABASE_URL=...`, then run `npm install`, `npm run db:migrate`, and `npm run admin:create`. The external URL is a secret; do not paste it into GitHub or chat.
 5. After the schema and admin have been created, remove the temporary `.env` file from your laptop. Then open `/admin/login` on the deployed site and sign in.
 6. Check `/api/health`, make a small test booking request, and verify staff can sign in before sharing the site.
 
-Render's internal URL is intended for the hosted app; use the external URL from your laptop. Render requires TLS for external Postgres connections. Back up the Render PostgreSQL database before applying future schema changes.
+Render's internal URL is intended for the hosted app; use the external URL from your laptop. Render requires TLS for external Postgres connections. The free database expires after 30 days and has no backups, and the free web service can sleep when idle; use this only as a test deployment. For real dormitory bookings, choose a paid database and arrange backups before collecting customer data. Back up the Render PostgreSQL database before applying future schema changes.
 
 ## API overview
 
