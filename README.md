@@ -11,7 +11,9 @@ Mobile-first public booking website with a separate staff dashboard, Express API
 - Server-side price calculation, 24-hour UTC instants from Asia/Kolkata check-in dates, password hashing, HTTP-only session cookies, login throttling, parameterized SQL, and expiring 15-minute pending bed holds.
 - Render Blueprint (`render.yaml`) and environment template.
 
-Payment is manual. The site never confirms a payment because a guest typed a UTR. Staff must check their bank/UPI records and verify it in the dashboard.
+Payment is manual. The site never confirms a payment because a guest typed a UTR. Staff must check their bank/UPI records and verify it in the dashboard. The public site does not print the UPI ID; after a booking request it generates an amount-specific UPI QR for the selected full stay.
+
+Booking requests require an ID document type and number. The number is encrypted in PostgreSQL using AES-256-GCM with a key derived from `IDENTITY_ENCRYPTION_KEY` or `SESSION_SECRET`; only signed-in staff can view it for an in-person check-in match. Keep the production `SESSION_SECRET` stable and private. Guests must opt in to WhatsApp updates. Automatic WhatsApp confirmation is sent only after staff mark both payment verified and booking confirmed, and requires WhatsApp Cloud API credentials plus an approved message template (`WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_TEMPLATE_NAME`, `WHATSAPP_TEMPLATE_LANGUAGE`). Without those credentials, staff still confirm bookings in the dashboard and must contact guests manually. The 20-minute message is an operational estimate, not an automatic payment guarantee.
 
 ## Run locally
 

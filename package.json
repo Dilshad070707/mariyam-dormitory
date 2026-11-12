@@ -9,7 +9,9 @@
     "db:migrate": "node server/src/migrate.js",
     "admin:create": "node server/src/create-admin.js"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "connect-pg-simple": "^10.0.0",
@@ -18,6 +20,7 @@
     "express-rate-limit": "^7.5.0",
     "express-session": "^1.18.1",
     "helmet": "^8.0.0",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "qrcode": "^1.5.4"
   }
 }
