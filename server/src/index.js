@@ -10,15 +10,17 @@ const QRCode = require('qrcode');
 const { rateLimit } = require('express-rate-limit');
 const { pool, query } = require('./db');
 const app = express();
-if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) throw new Error('SESSION_SECRET must be set in production.');
+if (process.env.NODE_ENV === 'production' && !(process.env.SESSION_SECRET || 'local-only-change-this-secret')) throw new Error('SESSION_SECRET must be set in production.');
 if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'], fontSrc: ["'self'", 'https://fonts.gstatic.com'], imgSrc: ["'self'", 'data:', 'https:'], scriptSrc: ["'self'"], connectSrc: ["'self'"] } } }));
 app.use(express.json({ limit: '1mb' }));
 app.use(session({ store: new PgSession({ pool, createTableIfMissing: true }), secret: process.env.SESSION_SECRET || 'local-only-change-this-secret', resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 8 * 60 * 60 * 1000 } }));
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: true, legacyHeaders: false });
 const bookingLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+const emailCodeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false });
 const auth = (req,res,next) => req.session.admin ? next() : res.status(401).json({ error:'Admin login required.' });
 const admin = (req,res,next) => req.session.admin?.role === 'admin' ? next() : res.status(403).json({ error:'Admin permission required.' });
+const customerAuth = (req,res,next) => req.session.customer?.email ? next() : res.status(401).json({error:'Sign in with your email to view your profile.'});
 app.use('/api', (req,res,next) => { if (!['POST','PUT','PATCH','DELETE'].includes(req.method)) return next(); const origin=req.get('origin'); const allowed=process.env.APP_ORIGIN || `${req.protocol}://${req.get('host')}`; if (origin && origin !== allowed) return res.status(403).json({error:'Request origin is not allowed.'}); next(); });
 const settings = async () => { const r = await query('SELECT key,value FROM business_settings'); return Object.fromEntries(r.rows.map(x=>[x.key,x.value])); };
 const todayAtTen = (date) => { const [y,m,day]=date.split('-').map(Number); const probe=new Date(Date.UTC(y,m-1,day)); if(probe.toISOString().slice(0,10)!==date) throw new Error('Invalid check-in date.'); return new Date(`${date}T10:00:00+05:30`); };
@@ -45,6 +47,45 @@ const sendBookingEmail = async booking => {
   return true;
 };
 app.get('/api/health', async (req,res) => { try { await query('SELECT 1'); res.json({ ok:true }); } catch { res.status(503).json({ ok:false }); } });
+app.post('/api/profile/request-code',emailCodeLimiter,async(req,res)=>{
+  const email=String(req.body?.email||'').trim().toLowerCase();
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254)return res.status(400).json({error:'Enter a valid email address.'});
+  if(!process.env.RESEND_API_KEY||!process.env.RESEND_FROM_EMAIL)return res.status(503).json({error:'Email login is not enabled yet. Email service needs to be set up first.'});
+  const code=String(crypto.randomInt(100000,1000000)),codeHash=crypto.createHmac('sha256',(process.env.SESSION_SECRET || 'local-only-change-this-secret')).update(`${email}:${code}`).digest('hex');
+  try{
+    await query('DELETE FROM email_login_codes WHERE email=$1 OR expires_at<now()',[email]);
+    const saved=await query("INSERT INTO email_login_codes(email,code_hash,expires_at) VALUES($1,$2,now()+interval '10 minutes') RETURNING id",[email,codeHash]);
+    const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json','Idempotency-Key':`profile-login/${saved.rows[0].id}`},body:JSON.stringify({from:process.env.RESEND_FROM_EMAIL,to:email,subject:'Your Mariyam Dormitory sign-in code',text:`Your sign-in code is ${code}. It expires in 10 minutes. If you did not request this code, you can ignore this email.`})});
+    if(!response.ok){await query('DELETE FROM email_login_codes WHERE id=$1',[saved.rows[0].id]);throw new Error(`Email API returned ${response.status}`);}
+    res.json({ok:true,message:'A sign-in code was sent to your email. It expires in 10 minutes.'});
+  }catch(e){console.error('Profile login email failed:',e.message);res.status(502).json({error:'Could not send the sign-in email. Check the email service settings and try again.'});}
+});
+app.post('/api/profile/verify-code',emailCodeLimiter,async(req,res)=>{
+  const email=String(req.body?.email||'').trim().toLowerCase(),code=String(req.body?.code||'').trim();
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!/^[0-9]{6}$/.test(code))return res.status(400).json({error:'Enter your email and the 6-digit code.'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const found=await client.query("SELECT id,code_hash,attempts FROM email_login_codes WHERE email=$1 AND used_at IS NULL AND expires_at>now() ORDER BY created_at DESC LIMIT 1 FOR UPDATE",[email]);
+    if(!found.rowCount||found.rows[0].attempts>=5){await client.query('ROLLBACK');return res.status(401).json({error:'That code expired or is no longer valid. Request a new one.'});}
+    const expected=Buffer.from(found.rows[0].code_hash,'hex'),actual=Buffer.from(crypto.createHmac('sha256',(process.env.SESSION_SECRET || 'local-only-change-this-secret')).update(`${email}:${code}`).digest('hex'),'hex');
+    if(expected.length!==actual.length||!crypto.timingSafeEqual(expected,actual)){await client.query('UPDATE email_login_codes SET attempts=attempts+1 WHERE id=$1',[found.rows[0].id]);await client.query('COMMIT');return res.status(401).json({error:'That code is incorrect. Check the email and try again.'});}
+    await client.query('UPDATE email_login_codes SET used_at=now() WHERE id=$1',[found.rows[0].id]);
+    await client.query('COMMIT');
+    req.session.regenerate(err=>{if(err)return res.status(500).json({error:'Unable to start your profile session.'});req.session.customer={email};res.json({email});});
+  }catch{await client.query('ROLLBACK').catch(()=>{});res.status(500).json({error:'Unable to verify the sign-in code.'});}
+  finally{client.release();}
+});
+app.get('/api/profile/me',customerAuth,(req,res)=>res.json({email:req.session.customer.email}));
+app.post('/api/profile/logout',customerAuth,(req,res)=>req.session.destroy(()=>res.json({ok:true})));
+app.get('/api/profile/bookings',customerAuth,async(req,res)=>{
+  try{
+    const result=await query(`SELECT b.reference,b.category,b.check_in,b.expected_check_out,b.duration_days,b.status,b.payment_status,b.amount,b.advance_amount,bd.label bed_label FROM bookings b JOIN customers c ON c.id=b.customer_id LEFT JOIN beds bd ON bd.id=b.bed_id WHERE lower(c.email)=lower($1) ORDER BY b.created_at DESC LIMIT 100`,[req.session.customer.email]);
+    const s=await settings();
+    for(const booking of result.rows){if(booking.status==='pending'&&booking.payment_status==='pending'&&Number(booking.advance_amount)>0){const uri='upi://pay?'+new URLSearchParams({pa:s.business.upiId,pn:s.business.name,am:Number(booking.advance_amount).toFixed(2),cu:'INR',tn:`Dormitory booking ${booking.reference}`}).toString();booking.qrCodeDataUrl=await QRCode.toDataURL(uri,{width:220,margin:1,errorCorrectionLevel:'M'});}}
+    res.json({email:req.session.customer.email,bookings:result.rows});
+  }catch{res.status(500).json({error:'Unable to load your bookings.'});}
+});
 app.get('/api/public/settings', async (req,res) => { try { const s=await settings(); const {upiId,...publicBusiness}=s.business; res.json({...s,business:publicBusiness}); } catch { res.status(500).json({error:'Unable to load business settings.'}); } });
 app.get('/api/availability', async (req,res) => {
   try {
@@ -60,7 +101,7 @@ app.get('/api/availability', async (req,res) => {
 app.post('/api/bookings', bookingLimiter, async (req,res) => {
   const {date,checkOutDate,category,count,name,phone,email,identityType,identityNumber,whatsappConsent}=req.body||{}; const n=Number(count),duration=Math.round((Date.parse(`${checkOutDate}T00:00:00Z`)-Date.parse(`${date}T00:00:00Z`))/86400000);
   const validIdentityTypes=['aadhaar','pan','voter','driving_license'];
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date||'') || !/^\d{4}-\d{2}-\d{2}$/.test(checkOutDate||'') || !['upper','lower'].includes(category) || !Number.isInteger(n) || n<1 || n>10 || !Number.isInteger(duration) || duration<1 || duration>30 || !name?.trim() || !/^\+?[0-9 ()-]{8,18}$/.test(phone||'') || !validIdentityTypes.includes(identityType) || !identityNumber?.trim() || identityNumber.trim().length>24 || whatsappConsent!==true) return res.status(400).json({error:'Please complete the required dates, identity proof details, and WhatsApp consent.'});
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date||'') || !/^\d{4}-\d{2}-\d{2}$/.test(checkOutDate||'') || !['upper','lower'].includes(category) || !Number.isInteger(n) || n<1 || n>10 || !Number.isInteger(duration) || duration<1 || duration>30 || !name?.trim() || !/^\+?[0-9 ()-]{8,18}$/.test(phone||'') || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email||'') || !validIdentityTypes.includes(identityType) || !identityNumber?.trim() || identityNumber.trim().length>24 || whatsappConsent!==true) return res.status(400).json({error:'Please complete the required dates, email, identity proof details, and WhatsApp consent.'});
   const client=await pool.connect();
   try {
     const s=await settings(), start=todayAtTen(date), end=todayAtTen(checkOutDate), price=category==='upper'?s.business.upperPrice:s.business.lowerPrice, totalPrice=price*duration, encryptedIdentity=encryptIdentity(identityNumber.trim().replace(/\s+/g,'').toUpperCase());
