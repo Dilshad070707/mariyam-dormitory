@@ -47,7 +47,23 @@ const sendBookingEmail = async booking => {
   return true;
 };
 app.get('/api/health', async (req,res) => { try { await query('SELECT 1'); res.json({ ok:true }); } catch { res.status(503).json({ ok:false }); } });
-app.post('/api/profile/request-code',emailCodeLimiter,async(req,res)=>{
+app.post('/api/profile/register',emailCodeLimiter,async(req,res)=>{
+  const email=String(req.body?.email||'').trim().toLowerCase(),password=String(req.body?.password||'');
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254||password.length<12||Buffer.byteLength(password,'utf8')>72)return res.status(400).json({error:'Use a valid email and a password of 12–72 characters.'});
+  try{
+    const passwordHash=await bcrypt.hash(password,12);
+    await query('INSERT INTO customer_accounts(email,password_hash) VALUES($1,$2)',[email,passwordHash]);
+    req.session.regenerate(err=>{if(err)return res.status(500).json({error:'Unable to start your account session.'});req.session.customer={email};req.session.cookie.maxAge=30*24*60*60*1000;req.session.save(saveErr=>{if(saveErr)return res.status(500).json({error:'Unable to save your account session.'});res.status(201).json({email});});});
+  }catch(e){if(e.code==='23505')return res.status(409).json({error:'An account already exists for this email. Use Sign in instead.'});res.status(500).json({error:'Unable to create your account.'});}
+});
+app.post('/api/profile/login',emailCodeLimiter,async(req,res)=>{
+  const email=String(req.body?.email||'').trim().toLowerCase(),password=String(req.body?.password||'');
+  try{
+    const found=await query('SELECT password_hash FROM customer_accounts WHERE email=$1',[email]);
+    if(!found.rowCount||!await bcrypt.compare(password,found.rows[0].password_hash))return res.status(401).json({error:'Email or password is incorrect.'});
+    req.session.regenerate(err=>{if(err)return res.status(500).json({error:'Unable to start your account session.'});req.session.customer={email};req.session.cookie.maxAge=30*24*60*60*1000;req.session.save(saveErr=>{if(saveErr)return res.status(500).json({error:'Unable to save your account session.'});res.json({email});});});
+  }catch{res.status(500).json({error:'Unable to sign in.'});}
+});app.post('/api/profile/request-code',emailCodeLimiter,async(req,res)=>{
   const email=String(req.body?.email||'').trim().toLowerCase();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254)return res.status(400).json({error:'Enter a valid email address.'});
   if(!process.env.RESEND_API_KEY||!process.env.RESEND_FROM_EMAIL)return res.status(503).json({error:'Email login is not enabled yet. Email service needs to be set up first.'});
@@ -98,9 +114,10 @@ app.get('/api/availability', async (req,res) => {
     res.json({date,category,available:r.rows.length, beds:r.rows.slice(0,n), bedLabels:r.rows.map(b=>b.label), price, totalPrice:price*duration, durationDays:duration, durationHours:24*duration, checkIn:'10:00', checkOutDate:dateAfterDays(date,duration), checkOut:'10:00'});
   } catch(e) { res.status(400).json({error:e.message||'Unable to check availability.'}); }
 });
-app.post('/api/bookings', bookingLimiter, async (req,res) => {
+app.post('/api/bookings', customerAuth, bookingLimiter, async (req,res) => {
   const {date,checkOutDate,category,count,name,phone,email,identityType,identityNumber,whatsappConsent}=req.body||{}; const n=Number(count),duration=Math.round((Date.parse(`${checkOutDate}T00:00:00Z`)-Date.parse(`${date}T00:00:00Z`))/86400000);
   const validIdentityTypes=['aadhaar','pan','voter','driving_license'];
+  if(String(email||'' ).trim().toLowerCase()!==req.session.customer.email)return res.status(403).json({error:'Sign in with the same email address you entered for this booking.'});
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date||'') || !/^\d{4}-\d{2}-\d{2}$/.test(checkOutDate||'') || !['upper','lower'].includes(category) || !Number.isInteger(n) || n<1 || n>10 || !Number.isInteger(duration) || duration<1 || duration>30 || !name?.trim() || !/^\+?[0-9 ()-]{8,18}$/.test(phone||'') || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email||'') || !validIdentityTypes.includes(identityType) || !identityNumber?.trim() || identityNumber.trim().length>24 || whatsappConsent!==true) return res.status(400).json({error:'Please complete the required dates, email, identity proof details, and WhatsApp consent.'});
   const client=await pool.connect();
   try {
