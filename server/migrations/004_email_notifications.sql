@@ -1,0 +1,2 @@
+ALTER TABLE bookings
+  ADD COLUMN IF NOT EXISTS email_notified_at TIMESTAMPTZ;

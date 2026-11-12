@@ -24,6 +24,7 @@ const settings = async () => { const r = await query('SELECT key,value FROM busi
 const todayAtTen = (date) => { const [y,m,day]=date.split('-').map(Number); const probe=new Date(Date.UTC(y,m-1,day)); if(probe.toISOString().slice(0,10)!==date) throw new Error('Invalid check-in date.'); return new Date(`${date}T10:00:00+05:30`); };
 const dateAfterDays = (date, days) => { const [y,m,day]=date.split('-').map(Number); return new Date(Date.UTC(y,m-1,day+days)).toISOString().slice(0,10); };
 const reference = () => 'MD-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2,6).toUpperCase();
+const normalizePhone = value => { const digits=String(value||'').replace(/\D/g,''); return digits.length===12&&digits.startsWith('91')?digits.slice(2):digits; };
 const identityKey = () => crypto.createHash('sha256').update(process.env.IDENTITY_ENCRYPTION_KEY || process.env.SESSION_SECRET || 'local-only-change-this-secret').digest();
 const encryptIdentity = value => { const iv=crypto.randomBytes(12), cipher=crypto.createCipheriv('aes-256-gcm',identityKey(),iv), encrypted=Buffer.concat([cipher.update(value,'utf8'),cipher.final()]); return [iv.toString('base64url'),cipher.getAuthTag().toString('base64url'),encrypted.toString('base64url')].join('.'); };
 const decryptIdentity = value => { const [iv,tag,data]=String(value).split('.'), decipher=crypto.createDecipheriv('aes-256-gcm',identityKey(),Buffer.from(iv,'base64url')); decipher.setAuthTag(Buffer.from(tag,'base64url')); return Buffer.concat([decipher.update(Buffer.from(data,'base64url')),decipher.final()]).toString('utf8'); };
@@ -33,6 +34,14 @@ const sendBookingWhatsApp = async booking => {
   let recipient=String(booking.phone).replace(/\D/g,'');if(recipient.length===10)recipient='91'+recipient;
   const response=await fetch(`https://graph.facebook.com/${process.env.WHATSAPP_GRAPH_API_VERSION||'v26.0'}/${phoneId}/messages`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({messaging_product:'whatsapp',to:recipient,type:'template',template:{name:templateName,language:{code:process.env.WHATSAPP_TEMPLATE_LANGUAGE||'en'},components:[{type:'body',parameters:[{type:'text',text:booking.name},{type:'text',text:booking.reference},{type:'text',text:String(booking.advance_amount)},{type:'text',text:new Date(booking.check_in).toLocaleString('en-IN',{dateStyle:'medium',timeStyle:'short',timeZone:'Asia/Kolkata'})},{type:'text',text:new Date(booking.expected_check_out).toLocaleString('en-IN',{dateStyle:'medium',timeStyle:'short',timeZone:'Asia/Kolkata'})}]}]}})});
   if(!response.ok) throw new Error(`WhatsApp API returned ${response.status}`);
+  return true;
+};
+const sendBookingEmail = async booking => {
+  const { RESEND_API_KEY:apiKey, RESEND_FROM_EMAIL:from }=process.env;
+  if(!apiKey||!from||!booking.email||booking.email_notified_at)return false;
+  const checkIn=new Date(booking.check_in).toLocaleString('en-IN',{dateStyle:'medium',timeStyle:'short',timeZone:'Asia/Kolkata'}),checkOut=new Date(booking.expected_check_out).toLocaleString('en-IN',{dateStyle:'medium',timeStyle:'short',timeZone:'Asia/Kolkata'});
+  const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json','Idempotency-Key':`booking-confirmation/${booking.id}`},body:JSON.stringify({from,to:booking.email,subject:`Mariyam Dormitory booking confirmed · ${booking.reference}`,text:`Hello ${booking.name},\n\nYour payment has been verified and your booking is confirmed.\n\nBooking reference: ${booking.reference}\nBed: ${booking.bed_label||booking.category}\nCheck-in: ${checkIn}\nCheck-out: ${checkOut}\nTotal paid: ₹${Number(booking.advance_amount||booking.amount).toLocaleString('en-IN')}\n\nPlease show the ID you entered at check-in.\n\nMariyam Dormitory, Mumbai`})});
+  if(!response.ok)throw new Error(`Email API returned ${response.status}`);
   return true;
 };
 app.get('/api/health', async (req,res) => { try { await query('SELECT 1'); res.json({ ok:true }); } catch { res.status(503).json({ ok:false }); } });
@@ -69,7 +78,19 @@ app.post('/api/bookings', bookingLimiter, async (req,res) => {
   } catch(e) { await client.query('ROLLBACK').catch(()=>{}); res.status(e.code==='23P01'||e.code==='23505'?409:500).json({error:e.code==='23505'?'This UTR has already been submitted.':'Unable to create booking.'}); }
   finally {client.release();}
 });
-app.get('/api/bookings/:reference', async(req,res)=>{ try { const r=await query(`SELECT b.reference,b.category,b.check_in,b.expected_check_out,b.duration_days,b.status,b.payment_status,b.amount,b.advance_amount,bd.label bed_label,c.name FROM bookings b JOIN customers c ON c.id=b.customer_id LEFT JOIN beds bd ON bd.id=b.bed_id WHERE b.reference=$1`,[req.params.reference]); if(!r.rowCount)return res.status(404).json({error:'Booking not found.'});const booking=r.rows[0];if(booking.payment_status!=='verified'&&Number(booking.advance_amount)>0){const s=await settings(),uri='upi://pay?'+new URLSearchParams({pa:s.business.upiId,pn:s.business.name,am:Number(booking.advance_amount).toFixed(2),cu:'INR',tn:`Dormitory booking ${booking.reference}`}).toString();booking.qrCodeDataUrl=await QRCode.toDataURL(uri,{width:240,margin:1,errorCorrectionLevel:'M'});}res.json(booking); }catch{res.status(500).json({error:'Unable to find booking.'});} });
+app.get('/api/bookings/:reference', async(req,res)=>{ try { const r=await query(`SELECT b.reference,b.category,b.check_in,b.expected_check_out,b.duration_days,b.status,b.payment_status,b.amount,b.advance_amount,bd.label bed_label,c.name FROM bookings b JOIN customers c ON c.id=b.customer_id LEFT JOIN beds bd ON bd.id=b.bed_id WHERE b.reference=$1`,[req.params.reference]); if(!r.rowCount)return res.status(404).json({error:'Booking not found.'});const booking=r.rows[0];if(booking.status==='pending'&&booking.payment_status==='pending'&&Number(booking.advance_amount)>0){const s=await settings(),uri='upi://pay?'+new URLSearchParams({pa:s.business.upiId,pn:s.business.name,am:Number(booking.advance_amount).toFixed(2),cu:'INR',tn:`Dormitory booking ${booking.reference}`}).toString();booking.qrCodeDataUrl=await QRCode.toDataURL(uri,{width:240,margin:1,errorCorrectionLevel:'M'});}res.json(booking); }catch{res.status(500).json({error:'Unable to find booking.'});} });
+app.post('/api/profile',bookingLimiter,async(req,res)=>{
+  const ref=String(req.body?.reference||'').trim(),phone=normalizePhone(req.body?.phone);
+  if(!ref||phone.length<10||phone.length>12)return res.status(400).json({error:'Enter your booking reference and the phone number used for that booking.'});
+  try{
+    const owner=await query('SELECT b.customer_id,c.phone FROM bookings b JOIN customers c ON c.id=b.customer_id WHERE b.reference=$1',[ref]);
+    if(!owner.rowCount||normalizePhone(owner.rows[0].phone)!==phone)return res.status(404).json({error:'We could not match that reference and phone number.'});
+    const result=await query(`SELECT b.reference,b.category,b.check_in,b.expected_check_out,b.duration_days,b.status,b.payment_status,b.amount,b.advance_amount,bd.label bed_label FROM bookings b LEFT JOIN beds bd ON bd.id=b.bed_id WHERE b.customer_id=$1 ORDER BY b.created_at DESC LIMIT 50`,[owner.rows[0].customer_id]);
+    const s=await settings();
+    for(const booking of result.rows){if(booking.status==='pending'&&booking.payment_status==='pending'&&Number(booking.advance_amount)>0){const uri='upi://pay?'+new URLSearchParams({pa:s.business.upiId,pn:s.business.name,am:Number(booking.advance_amount).toFixed(2),cu:'INR',tn:`Dormitory booking ${booking.reference}`}).toString();booking.qrCodeDataUrl=await QRCode.toDataURL(uri,{width:220,margin:1,errorCorrectionLevel:'M'});}}
+    res.json({bookings:result.rows});
+  }catch{res.status(500).json({error:'Unable to load your bookings.'});}
+});
 app.post('/api/payments', bookingLimiter, async(req,res)=>{const{reference:ref,utr}=req.body||{};if(!ref||!utr?.trim())return res.status(400).json({error:'Booking reference and UTR are required.'});try{const r=await query(`INSERT INTO payments(booking_id,utr,amount) SELECT id,$2,advance_amount FROM bookings WHERE reference=$1 RETURNING id`,[ref,utr.trim()]);if(!r.rowCount)return res.status(404).json({error:'Booking not found.'});await query("UPDATE bookings SET payment_status='pending_verification' WHERE reference=$1",[ref]);res.status(201).json({message:'Payment submitted for manual verification.'});}catch(e){res.status(e.code==='23505'?409:500).json({error:e.code==='23505'?'This UTR has already been submitted.':'Unable to submit payment.'});}});
 app.post('/api/admin/login',loginLimiter,async(req,res)=>{try{const email=String(req.body.email||'').toLowerCase().trim(), password=String(req.body.password||'');const r=await query('SELECT id,email,password_hash,role FROM admin_users WHERE email=$1 AND active=TRUE',[email]);if(!r.rowCount||!await bcrypt.compare(password,r.rows[0].password_hash))return res.status(401).json({error:'Email or password is incorrect.'});req.session.regenerate(err=>{if(err)return res.status(500).json({error:'Unable to start session.'});req.session.admin={id:r.rows[0].id,email:r.rows[0].email,role:r.rows[0].role};res.json({email:r.rows[0].email,role:r.rows[0].role});});}catch{res.status(500).json({error:'Unable to log in.'});}});
 app.post('/api/admin/logout',auth,(req,res)=>req.session.destroy(()=>res.json({ok:true})));
@@ -80,7 +101,7 @@ app.patch('/api/admin/bookings/:id',auth,async(req,res)=>{
   const{status,paymentStatus,reason}=req.body||{},allowed=['pending','confirmed','rejected','cancelled','checked_in','checked_out'];
   if(!allowed.includes(status))return res.status(400).json({error:'Invalid booking status.'});
   if(paymentStatus&&!['pending','pending_verification','verified','rejected','refund_pending','refunded'].includes(paymentStatus))return res.status(400).json({error:'Invalid payment status.'});
-  const c=await pool.connect();let notifyBooking=null,whatsappSent=false;
+  const c=await pool.connect();let notifyBooking=null,whatsappSent=false,emailSent=false;
   try{
     await c.query('BEGIN');
     const existing=await c.query('SELECT status,payment_status FROM bookings WHERE id=$1 FOR UPDATE',[req.params.id]);
@@ -91,14 +112,16 @@ app.patch('/api/admin/bookings/:id',auth,async(req,res)=>{
     if(!r.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:'Booking not found.'});}
     if(paymentStatus){await c.query('UPDATE bookings SET payment_status=$1 WHERE id=$2',[paymentStatus,r.rows[0].id]);await c.query('UPDATE payments SET status=$1,verified_by=$2,verified_at=CASE WHEN $1 IN (\'verified\',\'rejected\') THEN now() ELSE verified_at END WHERE id=(SELECT id FROM payments WHERE booking_id=$3 ORDER BY created_at DESC LIMIT 1)',[paymentStatus,req.session.admin.id,r.rows[0].id]);}
     await c.query('INSERT INTO audit_logs(admin_id,action,entity,entity_id,details) VALUES($1,$2,\'booking\',$3,$4)',[req.session.admin.id,status,String(r.rows[0].id),JSON.stringify({reason:reason||null,paymentStatus:paymentStatus||null})]);
-    const booking=await c.query('SELECT b.*,c.name,c.phone FROM bookings b JOIN customers c ON c.id=b.customer_id WHERE b.id=$1',[r.rows[0].id]);
-    if(booking.rows[0].status==='confirmed'&&booking.rows[0].payment_status==='verified'&&booking.rows[0].whatsapp_opt_in&&!booking.rows[0].whatsapp_notified_at)notifyBooking=booking.rows[0];
+    const booking=await c.query('SELECT b.*,c.name,c.phone,c.email,bd.label bed_label FROM bookings b JOIN customers c ON c.id=b.customer_id LEFT JOIN beds bd ON bd.id=b.bed_id WHERE b.id=$1',[r.rows[0].id]);
+    if(booking.rows[0].status==='confirmed'&&booking.rows[0].payment_status==='verified'&&((booking.rows[0].whatsapp_opt_in&&!booking.rows[0].whatsapp_notified_at)||(booking.rows[0].email&&!booking.rows[0].email_notified_at)))notifyBooking=booking.rows[0];
     await c.query('COMMIT');
     if(notifyBooking){
       try{whatsappSent=await sendBookingWhatsApp(notifyBooking);if(whatsappSent)await query('UPDATE bookings SET whatsapp_notified_at=now() WHERE id=$1',[notifyBooking.id]);}
       catch(err){console.error('WhatsApp booking confirmation failed:',err.message);}
+      try{emailSent=await sendBookingEmail(notifyBooking);if(emailSent)await query('UPDATE bookings SET email_notified_at=now() WHERE id=$1',[notifyBooking.id]);}
+      catch(err){console.error('Booking confirmation email failed:',err.message);}
     }
-    res.json({ok:true,reference:r.rows[0].reference,whatsappSent});
+    res.json({ok:true,reference:r.rows[0].reference,whatsappSent,emailSent});
   }catch(e){await c.query('ROLLBACK').catch(()=>{});res.status(e.code==='23P01'?409:500).json({error:e.code==='23P01'?'Bed conflicts with another confirmed booking.':'Unable to update booking.'});}
   finally{c.release();}
 });
